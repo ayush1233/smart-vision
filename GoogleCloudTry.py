@@ -1,192 +1,369 @@
 import os
-import streamlit as st
-import cv2
+import base64
 import tempfile
-from google.auth.transport.requests import Request
-from google.cloud import storage
-from google.oauth2.service_account import Credentials
 import requests
-from datetime import timedelta
+import cv2
+import streamlit as st
 
-# Google Cloud Configuration
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"path/to/your-service-account.json"  # Update this path
-ENDPOINT = "us-central1-aiplatform.googleapis.com"
-REGION = "us-central1"
-PROJECT_ID = "your-gcp-project-id"  # Update with your project ID
-MODEL_NAME = "meta/llama-3.2-90b-vision-instruct-maas"
-BUCKET_NAME = "your-gcs-bucket-name"  # Update with your GCS bucket name
+# ──────────────────────────────────────────────────────────
+# VERTEX AI CONFIGURATION  (only used if backend = Vertex AI)
+# ──────────────────────────────────────────────────────────
+VERTEX_CREDENTIALS = r"path/to/your-service-account.json"   # ← update
+VERTEX_ENDPOINT    = "us-central1-aiplatform.googleapis.com"
+VERTEX_REGION      = "us-central1"
+VERTEX_PROJECT     = "your-gcp-project-id"                  # ← update
+VERTEX_MODEL       = "meta/llama-3.2-90b-vision-instruct-maas"
+GCS_BUCKET         = "your-gcs-bucket-name"                 # ← update
+
+# ──────────────────────────────────────────────────────────
+# OLLAMA CONFIGURATION  (only used if backend = Ollama)
+# ──────────────────────────────────────────────────────────
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL    = "llama3.2-vision"   # alternatives: "llava", "llava:13b", "moondream"
+
+# ──────────────────────────────────────────────────────────
+# STATE
+# ──────────────────────────────────────────────────────────
 frame_contents = []
 
-def upload_image_to_gcs(local_path):
-    """Uploads an image to Google Cloud Storage and returns its GCS URI."""
+
+# ══════════════════════════════════════════════════════════
+#  OLLAMA BACKEND
+# ══════════════════════════════════════════════════════════
+
+def ollama_call(image_path: str, prompt: str) -> str | None:
+    """Send a frame to the local Ollama vision model and return the text response."""
+    with open(image_path, "rb") as f:
+        b64_image = base64.b64encode(f.read()).decode("utf-8")
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [b64_image],
+            }
+        ],
+        "stream": False,
+    }
+
     try:
-        credentials = Credentials.from_service_account_file(
-            os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            timeout=120,
         )
-        client = storage.Client(credentials=credentials)
-        bucket = client.bucket(BUCKET_NAME)
-        blob = bucket.blob(f"images/{os.path.basename(local_path)}")
-        blob.upload_from_filename(local_path)
-        gcs_uri = f"gs://{bucket.name}/{blob.name}"
-        print(f"Image uploaded to GCS with URI: {gcs_uri}")
-        return gcs_uri
+        if response.status_code == 200:
+            return response.json()["message"]["content"]
+        else:
+            st.error(f"Ollama error {response.status_code}: {response.text}")
+            return None
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "❌ Cannot connect to Ollama. Make sure Ollama is running: `ollama serve`"
+        )
+        return None
     except Exception as e:
-        st.error(f"Failed to upload image to GCS: {str(e)}")
+        st.error(f"Ollama error: {e}")
         return None
 
-def call_llama3_vision_api(gcs_uri, prompt):
-    """Calls the LLaMA 3.2 Vision API with a GCS URI and prompt."""
+
+def ollama_summarize(all_frame_text: str) -> str | None:
+    """Ask Ollama to summarise the collected frame descriptions."""
+    prompt = (
+        "Based on the following frame-by-frame descriptions of a video, "
+        "write a concise, coherent summary:\n\n"
+        + all_frame_text
+    )
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
     try:
-        credentials = Credentials.from_service_account_file(
-            os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            timeout=180,
         )
-        credentials.refresh(Request())
-        url = f"https://{ENDPOINT}/v1beta1/projects/{PROJECT_ID}/locations/{REGION}/endpoints/openapi/chat/completions"
-        payload = {
-            "model": MODEL_NAME,
-            "stream": False,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"image_url": {"url": gcs_uri}, "type": "image_url"},
-                        {"text": prompt, "type": "text"}
-                    ]
-                }
-            ],
-            "max_tokens": 100
-        }
-        headers = {
-            "Authorization": f"Bearer {credentials.token}",
-            "Content-Type": "application/json"
-        }
-        response = requests.post(url, headers=headers, json=payload, verify=False)
         if response.status_code == 200:
-            return response.json()
+            return response.json()["message"]["content"]
         else:
-            st.error(f"Error calling LLaMA API: {response.status_code} - {response.text}")
+            st.error(f"Ollama summarise error {response.status_code}: {response.text}")
             return None
     except Exception as e:
-        st.error(f"Error during API call: {str(e)}")
+        st.error(f"Ollama summarise error: {e}")
         return None
 
-def process_frame(gcs_uri, prompt):
-    stii = st.empty()
-    """Processes a single frame by calling the LLaMA API with a GCS URI and prompt."""
-    response = call_llama3_vision_api(gcs_uri, prompt)
-    if response:
-        content = response.get("choices", [])[0].get("message", {}).get("content", "")
-        stii.write(content)
-        frame_contents.append(content)
 
-def summarize_video_content():
-    """Sends a combined prompt to the model to summarize all collected frame contents."""
-    print('Summarization starts...')
-    combined_content = "\n".join(frame_contents)
-    summary_prompt = (
-        "Based on the following extracted information from individual frames, provide a useful summary as if describing the contents of a video:\n\n"
-        f"{combined_content}\n\n"
-        "Summarize this information and provide only the most relevant details for the purpose of the selected scenario."
+# ══════════════════════════════════════════════════════════
+#  VERTEX AI BACKEND
+# ══════════════════════════════════════════════════════════
+
+def _vertex_credentials():
+    """Return a refreshed Vertex AI token."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.service_account import Credentials
+
+    creds = Credentials.from_service_account_file(
+        VERTEX_CREDENTIALS,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
-    temp_filename = "summary_prompt.txt"
-    with open(temp_filename, "w") as f:
-        f.write(summary_prompt)
-    gcs_uri = upload_image_to_gcs(temp_filename)
-    if gcs_uri:
-        try:
-            summary_response = call_llama3_vision_api(gcs_uri, "Summarize the video contents based on this document.")
-            if summary_response and "choices" in summary_response:
-                summary_content = summary_response["choices"][0].get("message", {}).get("content", "")
-                st.write("Video Summary:")
-                st.write(summary_content)
-            else:
-                st.error("Failed to retrieve summary content from the LLaMA API response.")
-                print("LLaMA API Response:", summary_response)
-        except Exception as e:
-            st.error(f"An error occurred while calling the LLaMA API: {str(e)}")
-            print(f"LLaMA API call error: {str(e)}")
-    else:
-        st.error("Failed to upload the summary prompt to GCS for summarization.")
-    os.remove(temp_filename)
+    creds.refresh(Request())
+    return creds
 
-def process_frames_from_video(video_source, output_folder, interval, scenario_func):
-    """Processes frames from a video, uploads each to GCS, and processes them with the LLaMA API."""
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    video = cv2.VideoCapture(video_source) if isinstance(video_source, str) else video_source
-    fps = video.get(cv2.CAP_PROP_FPS)
-    frame_interval = int(fps * interval)
-    frame_count = 0
-    saved_frame_count = 0
+
+def _upload_to_gcs(local_path: str) -> str | None:
+    """Upload a file to GCS and return the gs:// URI."""
+    try:
+        from google.cloud import storage
+        from google.oauth2.service_account import Credentials
+
+        creds = Credentials.from_service_account_file(
+            VERTEX_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        client = storage.Client(credentials=creds)
+        bucket = client.bucket(GCS_BUCKET)
+        blob   = bucket.blob(f"frames/{os.path.basename(local_path)}")
+        blob.upload_from_filename(local_path)
+        uri = f"gs://{bucket.name}/{blob.name}"
+        return uri
+    except Exception as e:
+        st.error(f"GCS upload failed: {e}")
+        return None
+
+
+def vertex_call(image_path: str, prompt: str) -> str | None:
+    """Upload frame to GCS then call LLaMA on Vertex AI."""
+    gcs_uri = _upload_to_gcs(image_path)
+    if not gcs_uri:
+        return None
+
+    creds = _vertex_credentials()
+    url = (
+        f"https://{VERTEX_ENDPOINT}/v1beta1/projects/{VERTEX_PROJECT}"
+        f"/locations/{VERTEX_REGION}/endpoints/openapi/chat/completions"
+    )
+    payload = {
+        "model": VERTEX_MODEL,
+        "stream": False,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": gcs_uri}},
+                    {"type": "text",      "text": prompt},
+                ],
+            }
+        ],
+        "max_tokens": 150,
+    }
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type":  "application/json",
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload, verify=False, timeout=120)
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        else:
+            st.error(f"Vertex AI error {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Vertex AI error: {e}")
+        return None
+
+
+def vertex_summarize(all_frame_text: str) -> str | None:
+    """Summarise collected frame descriptions via Vertex AI."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
+    summary_prompt = (
+        "Based on the following extracted information from individual frames, "
+        "provide a concise summary of the video:\n\n" + all_frame_text
+    )
+    tmp.write(summary_prompt)
+    tmp.close()
+
+    result = vertex_call(tmp.name, "Summarise the video based on this document.")
+    os.unlink(tmp.name)
+    return result
+
+
+# ══════════════════════════════════════════════════════════
+#  UNIFIED DISPATCH
+# ══════════════════════════════════════════════════════════
+
+def analyze_frame(image_path: str, prompt: str, backend: str) -> str | None:
+    if backend == "🦙 Ollama (Local)":
+        return ollama_call(image_path, prompt)
+    else:
+        return vertex_call(image_path, prompt)
+
+
+def summarize_all(backend: str) -> str | None:
+    combined = "\n".join(frame_contents)
+    if backend == "🦙 Ollama (Local)":
+        return ollama_summarize(combined)
+    else:
+        return vertex_summarize(combined)
+
+
+# ══════════════════════════════════════════════════════════
+#  VIDEO PROCESSING
+# ══════════════════════════════════════════════════════════
+
+def process_video(video_source, output_folder: str, interval: int, scenario_func, backend: str):
+    """Extract frames and analyse each with the selected backend."""
+    os.makedirs(output_folder, exist_ok=True)
+
+    video = (
+        cv2.VideoCapture(video_source)
+        if isinstance(video_source, str)
+        else video_source
+    )
+
+    fps            = video.get(cv2.CAP_PROP_FPS) or 25
+    frame_interval = max(1, int(fps * interval))
+    frame_count    = 0
+    saved_count    = 0
+
+    progress_bar  = st.progress(0, text="Processing frames…")
+    result_area   = st.empty()
+
     while True:
-        success, frame = video.read()
-        if not success:
+        ok, frame = video.read()
+        if not ok:
             break
+
         if frame_count % frame_interval == 0:
-            frame_filename = os.path.join(output_folder, f"frame_{saved_frame_count:04d}.jpg")
-            cv2.imwrite(frame_filename, frame)
-            saved_frame_count += 1
-            gcs_uri = upload_image_to_gcs(frame_filename)
-            if gcs_uri:
-                prompt = scenario_func()
-                process_frame(gcs_uri, prompt)
+            frame_path = os.path.join(output_folder, f"frame_{saved_count:04d}.jpg")
+            cv2.imwrite(frame_path, frame)
+            saved_count += 1
+
+            prompt = scenario_func()
+            result_area.info(f"🔍 Analysing frame {saved_count}…")
+            content = analyze_frame(frame_path, prompt, backend)
+
+            if content:
+                frame_contents.append(content)
+                result_area.success(f"**Frame {saved_count}:** {content}")
+
+            progress_bar.progress(min(saved_count / 20, 1.0))
+
         frame_count += 1
+
     video.release()
     cv2.destroyAllWindows()
-    summarize_video_content()
+    progress_bar.empty()
 
-# Scenario Functions
-def prompt_ocr_details():
-    return "Extract brand name, pack size, and product type."
+    # ── Final summary ──
+    if frame_contents:
+        st.subheader("📝 Video Summary")
+        with st.spinner("Generating summary…"):
+            summary = summarize_all(backend)
+        if summary:
+            st.success(summary)
 
-def prompt_expiry_date():
-    return "Extract expiry date and MRP if available."
 
-def prompt_image_recognition():
-    return "Identify brand of each product and count for each brand."
+# ══════════════════════════════════════════════════════════
+#  SCENARIO PROMPTS
+# ══════════════════════════════════════════════════════════
 
-def prompt_freshness_detection():
-    return "Predict shelf life and detect freshness of produce."
-
-# Streamlit Interface
-st.title("Smart Vision")
-
-output_folder = tempfile.mkdtemp()
-input_option = st.radio("Choose input source", ("Upload a video", "Use Camera"))
-use_case = st.selectbox(
-    "Choose the use case scenario",
-    [
-        "OCR to extract details from image/label",
-        "Using OCR to get expiry date details",
-        "Image recognition and IR-based counting",
-        "Detecting freshness of fresh produce"
-    ]
-)
-
-scenario_func_map = {
-    "OCR to extract details from image/label": prompt_ocr_details,
-    "Using OCR to get expiry date details": prompt_expiry_date,
-    "Image recognition and IR-based counting": prompt_image_recognition,
-    "Detecting freshness of fresh produce": prompt_freshness_detection
+SCENARIOS = {
+    "📦 OCR — Extract product details":      "Extract brand name, pack size, and product type from the image.",
+    "📅 Expiry date & MRP detection":         "Extract the expiry date and MRP visible in the image.",
+    "🔍 Product counting by brand":           "Identify each brand visible and count how many items per brand.",
+    "🥦 Freshness detection of produce":      "Assess the freshness of any fruits or vegetables. Estimate shelf life.",
 }
-scenario_func = scenario_func_map[use_case]
 
-if input_option == "Upload a video":
-    video_file = st.file_uploader("Upload your video file", type=["mp4", "mov", "avi"])
-    if video_file:
-        temp_video_path = os.path.join(output_folder, "temp_video.mp4")
-        with open(temp_video_path, "wb") as f:
-            f.write(video_file.read())
-        st.video(temp_video_path)
-        st.text("Processing video...")
-        process_frames_from_video(temp_video_path, output_folder, interval=2, scenario_func=scenario_func)
-elif input_option == "Use Camera":
-    st.text("Starting camera...")
-    camera = cv2.VideoCapture(0)
-    if camera.isOpened():
-        st.text("Processing camera stream...")
-        process_frames_from_video(camera, output_folder, interval=2, scenario_func=scenario_func)
+
+# ══════════════════════════════════════════════════════════
+#  STREAMLIT UI
+# ══════════════════════════════════════════════════════════
+
+st.set_page_config(page_title="Smart Vision", page_icon="🧠", layout="wide")
+st.title("🧠 Smart Vision")
+st.caption("AI-powered video analysis — choose your backend below")
+
+# ── Sidebar ──────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Settings")
+
+    backend = st.radio(
+        "**AI Backend**",
+        ["🦙 Ollama (Local)", "☁️ Vertex AI (Cloud)"],
+        help=(
+            "Ollama: runs locally, no credentials needed. "
+            "Vertex AI: uses Google Cloud + LLaMA 3.2 90B."
+        ),
+    )
+
+    if backend == "🦙 Ollama (Local)":
+        ollama_model_choice = st.selectbox(
+            "Ollama model",
+            ["llama3.2-vision", "llava", "llava:13b", "moondream"],
+        )
+        OLLAMA_MODEL = ollama_model_choice
+
+        if st.button("🔌 Check Ollama connection"):
+            try:
+                r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+                if r.status_code == 200:
+                    models = [m["name"] for m in r.json().get("models", [])]
+                    if ollama_model_choice in models:
+                        st.success(f"✅ Connected — `{ollama_model_choice}` is ready")
+                    else:
+                        st.warning(
+                            f"⚠️ Connected but `{ollama_model_choice}` not found.\n\n"
+                            f"Run: `ollama pull {ollama_model_choice}`\n\n"
+                            f"Available: {', '.join(models) or 'none'}"
+                        )
+                else:
+                    st.error("Ollama returned an unexpected response.")
+            except Exception:
+                st.error("❌ Ollama not reachable. Start it with: `ollama serve`")
     else:
-        st.error("Could not open camera.")
+        st.info(
+            "**Vertex AI** requires:\n"
+            "- GCP service account JSON\n"
+            "- GCS bucket\n"
+            "- Update constants at top of `GoogleCloudTry.py`"
+        )
+
+    st.divider()
+    interval = st.slider("Frame interval (seconds)", 1, 10, 2)
+
+# ── Main area ────────────────────────────────────────────
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    use_case = st.selectbox("**Analysis scenario**", list(SCENARIOS.keys()))
+
+with col2:
+    input_source = st.radio("**Input source**", ["Upload a video", "Use camera"])
+
+scenario_prompt_fn = lambda: SCENARIOS[use_case]
+output_folder = tempfile.mkdtemp()
+
+st.divider()
+
+if input_source == "Upload a video":
+    video_file = st.file_uploader("Upload video", type=["mp4", "mov", "avi", "mkv"])
+    if video_file and st.button("▶️ Start Analysis"):
+        frame_contents.clear()
+        tmp_video = os.path.join(output_folder, "input.mp4")
+        with open(tmp_video, "wb") as f:
+            f.write(video_file.read())
+        st.video(tmp_video)
+        process_video(tmp_video, output_folder, interval, scenario_prompt_fn, backend)
+
+elif input_source == "Use camera":
+    if st.button("▶️ Start Camera Analysis"):
+        frame_contents.clear()
+        cam = cv2.VideoCapture(0)
+        if cam.isOpened():
+            process_video(cam, output_folder, interval, scenario_prompt_fn, backend)
+        else:
+            st.error("❌ Could not open camera.")
