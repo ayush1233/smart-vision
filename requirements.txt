@@ -1,0 +1,6 @@
+streamlit>=1.39.0
+google-cloud-storage>=2.18.0
+google-cloud-aiplatform>=1.70.0
+google-auth>=2.35.0
+opencv-python>=4.9.0
+requests>=2.32.0
